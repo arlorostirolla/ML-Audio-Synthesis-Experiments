@@ -1,0 +1,109 @@
+import numpy as np
+import librosa
+from pyswarm import pso
+
+import numpy as np
+from scipy import signal
+from scipy.signal import butter, lfilter
+
+def oscillator(freq, length, sr, osc_type='sine'):
+    t = np.linspace(0, length, int(length * sr), endpoint=False)
+
+    if osc_type == 'sine':
+        return np.sin(2 * np.pi * freq * t)
+    elif osc_type == 'square':
+        return signal.square(2 * np.pi * freq * t)
+    elif osc_type == 'sawtooth':
+        return signal.sawtooth(2 * np.pi * freq * t)
+    elif osc_type == 'triangle':
+        return signal.sawtooth(2 * np.pi * freq * t, 0.5)
+
+def adsr_envelope(length, sr, attack, decay, sustain, release):
+    total_samples = int(length * sr)
+    envelope = np.zeros(total_samples)
+
+    attack_samples = min(int(attack * sr), total_samples)
+    remaining_samples = total_samples - attack_samples
+
+    decay_samples = min(int(decay * sr), remaining_samples)
+    remaining_samples -= decay_samples
+
+    release_samples = min(int(release * sr), remaining_samples)
+    sustain_samples = remaining_samples - release_samples
+
+    # Attack
+    envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+
+    # Decay
+    decay_end = attack_samples + decay_samples
+    envelope[attack_samples:decay_end] = np.linspace(1, sustain, decay_samples)
+
+    # Sustain
+    sustain_end = decay_end + sustain_samples
+    envelope[decay_end:sustain_end] = sustain
+
+    # Release
+    envelope[sustain_end:] = np.linspace(sustain, 0, release_samples)
+
+    return envelope
+
+def lowpass_filter(audio, cutoff, resonance, sr):
+    nyq = 0.5 * sr
+    normalized_cutoff = cutoff / nyq
+    b, a = butter(2, normalized_cutoff, btype='low', analog=False, output='ba')
+    filtered_audio = lfilter(b, a, audio)
+    return filtered_audio * resonance
+
+def synth(params):
+    freq = params[0]
+    length = params[1]
+    sr = 44100
+
+    osc_type = ['sine', 'square', 'sawtooth', 'triangle'][int(params[2])]
+    attack = params[3]
+    decay = params[4]
+    sustain = params[5]
+    release = params[6]
+    cutoff = params[7]
+    resonance = params[8]
+    audio = oscillator(freq, length, sr, osc_type)
+
+    audio = lowpass_filter(audio, cutoff, resonance, sr)
+    envelope = adsr_envelope(length, sr, attack, decay, sustain, release)
+
+    return audio * envelope
+
+# Load the target .wav file
+target_file = './528491.wav'
+target_audio, sr = librosa.load(target_file, sr=None)
+
+# Define the objective function
+def objective_function(params):
+    generated_audio = synth(params)
+    print('1')
+    # Make sure both signals have the same length
+    min_length = min(len(target_audio), len(generated_audio))
+    target_audio_trimmed = target_audio[:min_length]
+    generated_audio_trimmed = generated_audio[:min_length]
+
+    # Calculate the mean squared error (MSE) between the target and generated audio
+    mse = np.mean((target_audio_trimmed - generated_audio_trimmed) ** 2)
+    return mse
+
+# Define parameter bounds for the synth
+param_bounds = [
+    (20, 20000),    # Oscillator frequency (Hz) - adjust the range as needed
+    (0.1, 5),       # Note length (s) - adjust the range as needed
+    (0, 3),         # Oscillator type (0: sine, 1: square, 2: sawtooth, 3: triangle)
+    (0.001, 1),     # Attack time (s) - adjust the range as needed
+    (0.001, 1),     # Decay time (s) - adjust the range as needed
+    (0, 1),         # Sustain level (0 to 1)
+    (0.001, 1),     # Release time (s) - adjust the range as needed
+    (20, 20000),    # Low-pass filter cutoff frequency (Hz) - adjust the range as needed
+    (0.1, 10),      # Filter resonance or Q-factor - adjust the range as needed
+]
+
+# Run Particle Swarm Optimization
+optimal_params, _ = pso(objective_function, *zip(*param_bounds))
+
+print("Optimal parameters:", optimal_params)
