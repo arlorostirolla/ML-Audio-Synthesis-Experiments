@@ -6,8 +6,28 @@ import soundfile as sf
 import itertools
 import random
 from functools import partial
+from scipy.io import wavfile
 
 oscillator_types = ['sine', 'square', 'sawtooth', 'triangle', 'pwm', 'noise', 'sine2', 'sawtooth2', 'triangle2', 'harmonic', 'sawtooth3', 'triangle3', 'square3', 'fm_sine', 'fm_square', 'fm_sawtooth', 'fm_triangle']
+
+
+def analyze_wav(file_path):
+    # Load the .wav file
+    sample_rate, audio_data = wavfile.read(file_path)
+
+    # Convert stereo audio to mono if necessary
+    if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+        audio_data = audio_data.mean(axis=1)
+
+    # Calculate the duration of the audio in seconds
+    duration = len(audio_data) / sample_rate
+
+    # Estimate the pitch using librosa
+    pitches, magnitudes = librosa.piptrack(y=audio_data.astype(np.float32), sr=sample_rate)
+    index = magnitudes.argmax()
+    pitch = pitches[index // pitches.shape[0], index % pitches.shape[1]]
+
+    return pitch, duration, sample_rate
 
 def pwm_wave(freq, length, sr, duty_cycle=0.5):
     t = np.linspace(0, length, int(length * sr), endpoint=False)
@@ -183,7 +203,6 @@ def reverb(audio, sr, delay, decay, on):
 def distortion(audio, threshold, on):
     # Apply distortion effect using soft clipping
     # The threshold parameter should be a value between 0 and 1
-    
     # Apply soft clipping function
     
     if on:
@@ -232,4 +251,20 @@ def equalizer(audio, sr, eq_params, on):
     else:
         return audio
 
+def generate_wavetables(harmonic_amplitudes, num_harmonics, num_wavetables, wavetable_size):
+    wavetables = []
 
+    for i in range(num_wavetables):
+        wavetable = np.zeros(wavetable_size)
+        harmonics = np.random.uniform(0, 1, num_harmonics) * harmonic_amplitudes
+
+        for h in range(1, num_harmonics + 1):
+            harmonic_wave = harmonics[h - 1] * np.sin(2 * np.pi * h * np.arange(wavetable_size) / wavetable_size)
+            wavetable += harmonic_wave
+
+        # Normalize the wavetable
+        wavetable /= np.max(np.abs(wavetable))
+
+        wavetables.append(wavetable)
+
+    return wavetables
