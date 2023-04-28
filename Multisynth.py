@@ -1,6 +1,10 @@
 import numpy as np
 from abc import ABC, abstractmethod
 from effects_and_functions import *
+import sounddevice as sd
+import time
+import pydub
+from pydub import AudioSegment
 
 SAMPLE_RATE = 44100
 FREQUENCY = 440
@@ -22,16 +26,26 @@ class Synthesizer(ABC):
 
 class FMSynthesizer(Synthesizer):
 
-    def __init__(self, modulator_frequency_ratio, modulator_amplitude, *args, **kwargs):
+    def __init__(self, modulator_frequency_ratio, modulator_amplitude, modulator_wave, carrier_wave, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.modulator_frequency_ratio = modulator_frequency_ratio
         self.modulator_amplitude = modulator_amplitude
+        self.modulator_wave = modulator_wave
+        self.carrier_wave = carrier_wave
 
     def synthesize(self):
-        t = np.linspace(0, self.duration, self.duration * self.sample_rate, False)
-        modulator = np.sin(2 * np.pi * self.frequency * self.modulator_frequency_ratio * t)
-        carrier = np.sin(2 * np.pi * self.frequency * t + self.modulator_amplitude * modulator)
-        return (self.amplitude * carrier).astype(np.int16)
+        num_samples = int(self.duration * self.sample_rate)
+        t = np.linspace(0, self.duration, num_samples, False)
+        modulator_indices = ((self.frequency * self.modulator_frequency_ratio * t) % 1) * len(self.modulator_wave)
+        carrier_indices = ((self.frequency * t) % 1) * len(self.carrier_wave)
+
+        modulator = np.interp(modulator_indices, np.arange(len(self.modulator_wave)), self.modulator_wave)
+        carrier = np.interp(carrier_indices + self.modulator_amplitude * modulator, np.arange(len(self.carrier_wave)), self.carrier_wave)
+        out = (self.amplitude * carrier).astype(np.int16)
+        sd.play(out, 48000)
+        time.sleep(0.5)
+        sd.stop()
+        return out
 
 
 class GranularSynthesizer(Synthesizer):
@@ -62,14 +76,17 @@ class AdditiveSynthesizer(Synthesizer):
         self.harmonics_amplitudes = harmonics_amplitudes
 
     def synthesize(self):
-        t = np.linspace(0, self.duration, self.duration * self.sample_rate, False)
+        t = np.linspace(0, self.duration, int(self.duration * self.sample_rate), False)
         result = np.zeros_like(t)
 
         for i, amp in enumerate(self.harmonics_amplitudes):
             harmonic = (i + 1) * self.frequency
             result += amp * np.sin(2 * np.pi * harmonic * t)
-
-        return (self.amplitude * result).astype(np.int16)
+        out = (self.amplitude * result).astype(np.int16)
+        sd.play(out, 48000)
+        time.sleep(0.5)
+        sd.stop()
+        return out
 
 class WavetableSynthesizer(Synthesizer):
 
@@ -78,77 +95,83 @@ class WavetableSynthesizer(Synthesizer):
         self.wavetables = wavetables
 
     def synthesize(self):
-        num_wavetables = len(self.wavetables)
-        wavetable_size = len(self.wavetables[0])
-        t = np.linspace(0, self.duration, self.duration * self.sample_rate, False)
+        t = np.arange(int(self.duration * self.sample_rate))
+        result = np.zeros_like(t, dtype=np.float32)
 
-        # Interpolate between wavetables based on frequency
-        wavetable_idx = int(np.interp(self.frequency, [0, self.sample_rate / 2], [0, num_wavetables - 1]))
+        for i in range(len(t)):
+            wavetable_idx = 0
 
-        if wavetable_idx < num_wavetables - 1:
-            alpha = (self.frequency - self.wavetables[wavetable_idx].frequency) / (self.wavetables[wavetable_idx + 1].frequency - self.wavetables[wavetable_idx].frequency)
-            wavetable = (1 - alpha) * self.wavetables[wavetable_idx] + alpha * self.wavetables[wavetable_idx + 1]
-        else:
-            wavetable = self.wavetables[wavetable_idx]
+            # Find the appropriate wavetable index for the current frequency
+            while wavetable_idx < len(self.wavetables) - 2 and self.frequency > self.wavetables[wavetable_idx + 1][0]:
+                wavetable_idx += 1
 
-        # Generate waveform using the selected wavetable
-        phase = (t * self.frequency) % 1
-        waveform = np.interp(phase * wavetable_size, np.arange(wavetable_size), wavetable)
+            # Get the wavetables and their corresponding frequencies
+            wavetable_1_freq, wavetable_1 = self.wavetables[wavetable_idx]
+            wavetable_2_freq, wavetable_2 = self.wavetables[wavetable_idx + 1]
 
-        return (self.amplitude * waveform).astype(np.int16)
+            # Interpolate between the wavetables based on the frequency
+            alpha = (self.frequency - wavetable_1_freq) / (wavetable_2_freq - wavetable_1_freq)
+            result[i] = np.interp(t[i] % len(wavetable_1), np.arange(len(wavetable_1)), wavetable_1) * (1 - alpha) + np.interp(t[i] % len(wavetable_2), np.arange(len(wavetable_2)), wavetable_2) * alpha
 
-class ModularSynthesizer:
-    def __init__(self, sample_rate=44100):
-        self.modules = {}
-        self.connections = []
-        self.sample_rate = sample_rate
 
-    def add_module(self, name, module):
-        self.modules[name] = module
+        out = (self.amplitude * result).astype(np.int16)
+        sd.play(out, 48000)
+        time.sleep(0.5)
+        sd.stop()
+        return out
 
-    def connect(self, source_name, target_name, source_output=0, target_input=0):
-        self.connections.append((source_name, target_name, source_output, target_input))
 
-    def synthesize(self, duration):
-        # Process each module in the synthesizer
-        for name, module in self.modules.items():
-            module.process(duration, self.sample_rate)
-
-        # Apply the connections between modules
-        for source_name, target_name, source_output, target_input in self.connections:
-            source_module = self.modules[source_name]
-            target_module = self.modules[target_name]
-            source_signal = source_module.get_output(source_output)
-            target_module.set_input(target_input, source_signal)
-
-        # Return the final output of the last module
-        final_module_name = list(self.modules.keys())[-1]
-        final_module = self.modules[final_module_name]
-        return final_module.get_output(0)
     
 class Mixer:
-    def __init__(self, num_channels=20):
+    def __init__(self, num_channels=20, duration=DURATION, sample_rate=SAMPLE_RATE):
         self.num_channels = num_channels
-        self.channels = [[] for _ in range(num_channels)]
+        self.duration = duration
+        self.sample_rate = sample_rate
+        self.channels = [np.array([], dtype=np.int16) for _ in range(num_channels)]
 
-    def add_to_channel(self, channel, synthesizer):
+    def add_to_channel(self, channel, synthesized_wave):
         if 0 <= channel < self.num_channels:
-            self.channels[channel].append(synthesizer)
-        else:
-            raise ValueError(f"Invalid channel number {channel}. Must be between 0 and {self.num_channels - 1}.")
+            synthesized_wave = np.array(synthesized_wave)
 
-    def mix(self, normalize=True):
-        num_samples = int(DURATION * SAMPLE_RATE)
-        mixed_wave = np.zeros(num_samples)
+            if self.channels[channel].size == 0:  # If the channel is empty
+                self.channels[channel] = synthesized_wave
+            else:
+                channel_wave = self.channels[channel]
+
+                if synthesized_wave.size > channel_wave.size:
+                    # Pad the channel with zeros
+                    padding = np.zeros(synthesized_wave.size - channel_wave.size, dtype=synthesized_wave.dtype)
+                    self.channels[channel] = np.concatenate((channel_wave, padding))
+
+                if synthesized_wave.size < channel_wave.size:
+                    # Pad the synthesized_wave with zeros
+                    padding = np.zeros(channel_wave.size - synthesized_wave.size, dtype=synthesized_wave.dtype)
+                    synthesized_wave = np.concatenate((synthesized_wave, padding))
+
+                self.channels[channel] += synthesized_wave
+        else:
+            raise ValueError(f"Invalid channel number: {channel}. Must be between 0 and {self.num_channels - 1}.")
+
+
+    def mix(self, normalize=False):
+        mixed_wave = AudioSegment.silent(duration=int(self.duration * 1000), frame_rate=self.sample_rate)
 
         for channel in self.channels:
-            for synth in channel:
-                mixed_wave += synth.synthesize()
+            if len(channel) > 0:
+                channel_audio = AudioSegment(
+                    channel.tobytes(),
+                    frame_rate=self.sample_rate,
+                    sample_width=channel.dtype.itemsize,
+                    channels=1
+                )
+                mixed_wave = mixed_wave.overlay(channel_audio)
 
         if normalize:
-            mixed_wave = self._normalize(mixed_wave)
+            mixed_wave = mixed_wave.normalize()
 
-        return mixed_wave.astype(np.int16)
+        return np.frombuffer(mixed_wave.raw_data, dtype=np.int16)
+
+
 
     @staticmethod
     def _normalize(waveform):
@@ -157,39 +180,62 @@ class Mixer:
         scale = max(max_val / np.amax(waveform), -min_val / np.amin(waveform))
         return waveform * scale
     
-def setup_synths_and_mixer(fm_params, granular_params, additive_params, subtractive_params, wavetable_params, mixer_params):
+def setup_synths_and_mixer(fm_params, additive_params, wavetable_params, mixer_params,sr, duration):
     # Create synthesizer instances
     fm_synth = FMSynthesizer(**fm_params)
-    granular_synth = GranularSynthesizer(**granular_params)
+    #granular_synth = GranularSynthesizer(**granular_params)
     additive_synth = AdditiveSynthesizer(**additive_params)
     wavetable_synth = WavetableSynthesizer(**wavetable_params)
 
     # Create mixer instance
-    mixer = Mixer(**mixer_params)
+    mixer = Mixer(duration=duration, sample_rate=sr, **mixer_params)
 
     # Add synthesizers to mixer channels
     mixer.add_to_channel(0, fm_synth.synthesize())
-    mixer.add_to_channel(1, granular_synth.synthesize())
+    #mixer.add_to_channel(1, granular_synth.synthesize())
     mixer.add_to_channel(2, additive_synth.synthesize())
     mixer.add_to_channel(4, wavetable_synth.synthesize())
 
     return mixer
 
 def main():
-    file_path = ''
+    file_path = './528491.wav'
+    pitch, duration, sample_rate = analyze_wav(file_path)
+    print(pitch, duration, sample_rate)
+    wavetables = generate_wavetables(1, 12, 12,256)
+    # bounds: harmonic amplitudes = [0, 1], num_harmonics = [1, 50], num_wavetables = [1, 100], wavetable_size = [256, 2048]
+    # bounds: grain_size = [1, 1000], grain_rate = [1, 100], overlap = [0, 1]
+    #oscillator types: [0, 16]
+
+    # Create a mixer with 5 channels
 
     # Set up parameters for each synthesizer
-    fm_params = {"operators": operators, "algorithm": 1, "frequency": 440, "duration": 5, "sample_rate": 44100, "amplitude": 2**15-1}
-    granular_params = {"input_audio": input_audio, "grain_size": 1000, "grain_rate": 10, "duration": 5, "sample_rate": 44100, "amplitude": 2**15-1}
-    additive_params = {"harmonics": [0.6, 0.3, 0.15], "frequency": 440, "duration": 5, "sample_rate": 44100, "amplitude": 2**15-1}
-    subtractive_params = {"oscillator_type": "sawtooth", "frequency": 440, "duration": 5, "sample_rate": 44100, "amplitude": 2**15-1, "filter_type": "lowpass", "cutoff_frequency": 1000, "resonance": 0.5}
-    wavetable_params = {"wavetables": wavetables, "frequency": 440, "duration": 5, "sample_rate": 44100, "amplitude": 2**15-1}
+    fm_params = {"modulator_frequency_ratio": 2.0, "modulator_amplitude": 0.5, "modulator_wave": oscillator(freq=pitch, length=duration,osc_type="sine", sr=sample_rate), 
+                 "carrier_wave": oscillator(freq=pitch, length=duration,osc_type="triangle", sr=sample_rate), "sample_rate": sample_rate, "amplitude": 2**15-1, "duration": duration, "frequency": pitch}
+    #bounds: modulator_frequency_ratio = [0.1, 5.0], modulator_amplitude = [0, 1], modulator_waveform = [0, 16], carrier_waveform = [0, 16]
+
+    #granular_params = {"input_audio": input_audio, "grain_size": 1000, "grain_rate": 10, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
+    additive_params = {"harmonics_amplitudes": [0.6, 0.3, 0.15], "frequency": pitch, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
+    #bounds: harmonics = [0, 1], num_harmonics = [1, 50]
+
+    wavetable_params = {"wavetables": wavetables, "frequency": pitch, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
 
     # Set up mixer parameters
-    mixer_params = {"num_channels": 20, "sample_rate": 44100}
+    mixer_params = {"num_channels": 20}
 
     # Set up synthesizers and mixer
-    mixer = setup_synths_and_mixer(fm_params, granular_params, additive_params, subtractive_params, wavetable_params, mixer_params)
+    mixer = setup_synths_and_mixer(fm_params, additive_params, wavetable_params, mixer_params, sample_rate, duration)
 
     # Get the mixed output
     mixed_output = mixer.mix()
+    output_file_path = 'output.wav'
+    output_sample_rate = sample_rate  # You can replace this with the sample rate of your audio
+
+    # Normalize the audio to the maximum 16-bit integer range
+    mixed_output = (mixed_output / np.max(np.abs(mixed_output)) * 32767).astype(np.int16)
+
+    # Write the audio data to a WAV file
+    wavfile.write(output_file_path, output_sample_rate, mixed_output)
+
+if __name__ == "__main__":
+    main() 
