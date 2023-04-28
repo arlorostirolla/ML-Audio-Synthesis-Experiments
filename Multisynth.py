@@ -5,6 +5,10 @@ import sounddevice as sd
 import time
 import pydub
 from pydub import AudioSegment
+from functools import partial
+from pyswarm import pso
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
+import torch
 
 SAMPLE_RATE = 44100
 FREQUENCY = 440
@@ -12,6 +16,10 @@ DURATION = 5  # in seconds
 AMPLITUDE = 2 ** 15 - 1
 AUDIO_TYPE = "S16LE"  # 16-bit signed little-endian PCM
 
+model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
 class Synthesizer(ABC):
     def __init__(self, sample_rate=SAMPLE_RATE, frequency=FREQUENCY, duration=DURATION, amplitude=AMPLITUDE):
@@ -35,6 +43,8 @@ class FMSynthesizer(Synthesizer):
 
     def synthesize(self):
         num_samples = int(self.duration * self.sample_rate)
+        print(self.duration)
+        print(self.sample_rate)
         t = np.linspace(0, self.duration, num_samples, False)
         modulator_indices = ((self.frequency * self.modulator_frequency_ratio * t) % 1) * len(self.modulator_wave)
         carrier_indices = ((self.frequency * t) % 1) * len(self.carrier_wave)
@@ -42,9 +52,6 @@ class FMSynthesizer(Synthesizer):
         modulator = np.interp(modulator_indices, np.arange(len(self.modulator_wave)), self.modulator_wave)
         carrier = np.interp(carrier_indices + self.modulator_amplitude * modulator, np.arange(len(self.carrier_wave)), self.carrier_wave)
         out = (self.amplitude * carrier).astype(np.int16)
-        sd.play(out, 48000)
-        time.sleep(0.5)
-        sd.stop()
         return out
 
 
@@ -83,9 +90,6 @@ class AdditiveSynthesizer(Synthesizer):
             harmonic = (i + 1) * self.frequency
             result += amp * np.sin(2 * np.pi * harmonic * t)
         out = (self.amplitude * result).astype(np.int16)
-        sd.play(out, 48000)
-        time.sleep(0.5)
-        sd.stop()
         return out
 
 class WavetableSynthesizer(Synthesizer):
@@ -115,15 +119,10 @@ class WavetableSynthesizer(Synthesizer):
 
 
         out = (self.amplitude * result).astype(np.int16)
-        sd.play(out, 48000)
-        time.sleep(0.5)
-        sd.stop()
         return out
 
-
-    
 class Mixer:
-    def __init__(self, num_channels=20, duration=DURATION, sample_rate=SAMPLE_RATE):
+    def __init__(self, num_channels=3, duration=DURATION, sample_rate=SAMPLE_RATE):
         self.num_channels = num_channels
         self.duration = duration
         self.sample_rate = sample_rate
@@ -171,8 +170,6 @@ class Mixer:
 
         return np.frombuffer(mixed_wave.raw_data, dtype=np.int16)
 
-
-
     @staticmethod
     def _normalize(waveform):
         max_val = np.iinfo(np.int16).max
@@ -180,12 +177,20 @@ class Mixer:
         scale = max(max_val / np.amax(waveform), -min_val / np.amin(waveform))
         return waveform * scale
     
-def setup_synths_and_mixer(fm_params, additive_params, wavetable_params, mixer_params,sr, duration):
+    def add_effects(self, channel, effects):
+        if 0 <= channel < self.num_channels:
+            for effect in effects:
+                self.channels[channel] = effect(self.channels[channel])
+        else:
+            raise ValueError(f"Invalid channel number: {channel}. Must be between 0 and {self.num_channels - 1}.")
+        
+def setup_synths_and_mixer(fm_params, fm_effects_params, additive_params, additive_effects_params, wavetable_params, wavetable_effects_params, mixer_params, sr, duration):
     # Create synthesizer instances
     fm_synth = FMSynthesizer(**fm_params)
     #granular_synth = GranularSynthesizer(**granular_params)
     additive_synth = AdditiveSynthesizer(**additive_params)
-    wavetable_synth = WavetableSynthesizer(**wavetable_params)
+    wavetables = generate_wavetables(wavetable_params["harmonic_amplitudes"], wavetable_params["num_harmonics"], wavetable_params["num_wavetables"], wavetable_params["wavetable_size"])
+    wavetable_synth = WavetableSynthesizer(wavetables)
 
     # Create mixer instance
     mixer = Mixer(duration=duration, sample_rate=sr, **mixer_params)
@@ -193,49 +198,74 @@ def setup_synths_and_mixer(fm_params, additive_params, wavetable_params, mixer_p
     # Add synthesizers to mixer channels
     mixer.add_to_channel(0, fm_synth.synthesize())
     #mixer.add_to_channel(1, granular_synth.synthesize())
-    mixer.add_to_channel(2, additive_synth.synthesize())
-    mixer.add_to_channel(4, wavetable_synth.synthesize())
+    mixer.add_to_channel(1, additive_synth.synthesize())
+    mixer.add_to_channel(2, wavetable_synth.synthesize())
+
+    fm_reverb = partial(reverb, delay= fm_effects_params['delay'],decay=fm_effects_params['decay'], on = fm_effects_params['reverb_on'], sr=sr)
+    wavetable_reverb = partial(reverb, delay=wavetable_effects_params['delay'] ,decay=wavetable_effects_params['decay'], on=wavetable_effects_params['reverb_on'], sr=sr)
+    additive_reverb = partial(reverb, delay=additive_effects_params['delay'] ,decay=additive_effects_params['decay'], on=additive_effects_params['reverb_on'],sr=sr)
+
+    fm_distortion = partial(distortion, threshold=fm_effects_params['distortion_threshold'], gain=fm_effects_params['distortion_gain'], on=fm_effects_params['distortion_on'])
+    wavetable_distortion = partial(distortion, threshold=wavetable_effects_params['distortion_threshold'], gain=wavetable_effects_params['distortion_gain'], on=wavetable_effects_params['distortion_on'])
+    additive_distortion = partial(distortion, threshold=additive_effects_params['distortion_threshold'], gain=additive_effects_params['distortion_gain'], on=additive_effects_params['distortion_on'])
+
+    mixer.add_effects(0, [fm_distortion, fm_reverb])
+    mixer.add_effects(1, [additive_distortion, additive_reverb])
+    mixer.add_effects(2, [wavetable_distortion, wavetable_reverb])
 
     return mixer
+
+def perceptual_loss(reference_audio, synthesized_audio):
+    sample_rate, audio_data = wavfile.read(reference_audio)
+    ref_input_values = processor(audio_data, return_tensors="pt", padding=True).input_values.to(device)
+    synth_input_values = processor(synthesized_audio, return_tensors="pt", padding=True).input_values.to(device)
+
+    with torch.no_grad():
+        ref_features = model(ref_input_values).last_hidden_state
+        synth_features = model(synth_input_values).last_hidden_state
+
+    loss = torch.mean((ref_features - synth_features) ** 2).item()
+    return loss
+
+def objective_function(parameters):
+    print(1)
+    oscillator_types = ['sine', 'square', 'sawtooth', 'triangle', 'pwm', 'noise', 'sine2', 'sawtooth2', 'triangle2', 'harmonic', 'sawtooth3', 'triangle3', 'square3', 'fm_sine', 'fm_square', 'fm_sawtooth', 'fm_triangle']
+    # Unpack parameters and create mixer
+    # You will need to replace this with your actual parameter unpacking and mixer creation code
+    pitch, duration, sample_rate, amplitude = parameters[0], parameters[1], parameters[2], 2**15-1
+    mfr, ma, mw, cw = parameters[3], parameters[4], parameters[5], parameters[6]
+    ha1, ha2, ha3, ha4, ha5, ha6, ha7, ha8, ha9, ha10 = parameters[7], parameters[8], parameters[9], parameters[10], parameters[11], parameters[12], parameters[13], parameters[14], parameters[15], parameters[16]
+    wha1, wha2, wha3, wha4, wha5, wha6, wha7, wha8, wha9, wha10 = parameters[17], parameters[18], parameters[19], parameters[20], parameters[21], parameters[22], parameters[23], parameters[24], parameters[25], parameters[26]
+    num_wavetables, wavetable_size = parameters[27], parameters[28]
+    wavetable_reverb_delay, wave_table_reverb_decay, fm_reverb_reverb_delay, fm_reverb_decay, additive_reverb_delay, additive_reverb_decay = parameters[29], parameters[30], parameters[31], parameters[32], parameters[33], parameters[34]
+    wavetable_reverb_on, fm_reverb_on, additive_reverb_on = int(parameters[35]), int(parameters[36]), int(parameters[37])
+    wavetable_distortion_threshold, wavetable_distortion_gain, fm_distortion_threshold, fm_distortion_gain, additive_distortion_threshold, additive_distortion_gain = parameters[38], parameters[39], parameters[40], parameters[41], parameters[42], parameters[43]
+    wavetable_distortion_on, fm_distortion_on, additive_distortion_on = int(parameters[44]), int(parameters[45]), int(parameters[46])
+
+    wavetable_params = {"harmonic_amplitudes": [wha1, wha2, wha3, wha4, wha5, wha6, wha7, wha8, wha9, wha10], "num_harmonics": 10,"num_wavetables": int(num_wavetables), "wavetable_size": int(wavetable_size) }
+    fm_params = {"modulator_frequency_ratio": mfr, "modulator_amplitude": ma, "modulator_wave": oscillator(freq=pitch, length=duration ,osc_type=oscillator_types[int(mw)], sr=sample_rate), 
+                 "carrier_wave": oscillator(freq=pitch, length=duration,osc_type=oscillator_types[int(cw)], sr=sample_rate), "sample_rate": sample_rate, "amplitude": amplitude, "duration": duration, "frequency": pitch}
+    additive_params = {"harmonics_amplitudes": [ha1, ha2, ha3, ha4, ha5, ha6, ha7, ha8, ha9, ha10], "frequency": pitch, "duration": duration, "sample_rate": sample_rate, "amplitude": amplitude}
+    
+    wavetable_effects_params = {"delay": wavetable_reverb_delay, "decay": wave_table_reverb_decay, "reverb_on": wavetable_reverb_on, "distortion_threshold": wavetable_distortion_threshold, "distortion_gain": wavetable_distortion_gain, "distortion_on": wavetable_distortion_on}
+    fm_effects_params = {"delay": fm_reverb_reverb_delay, "decay": fm_reverb_decay, "reverb_on": fm_reverb_on, "distortion_threshold": fm_distortion_threshold, "distortion_gain": fm_distortion_gain, "distortion_on": fm_distortion_on}
+    additive_effects_params = {"delay": additive_reverb_delay, "decay": additive_reverb_decay, "reverb_on": additive_reverb_on, "distortion_threshold": additive_distortion_threshold, "distortion_gain": additive_distortion_gain, "distortion_on": additive_distortion_on}
+
+    mixer = setup_synths_and_mixer(fm_params, fm_effects_params, additive_params, additive_effects_params, wavetable_params, wavetable_effects_params, {"num_channels": 3}, sample_rate, duration)
+
+    synthesized_audio = mixer.mix()
+    loss = perceptual_loss('./528491.wav', synthesized_audio)
+    return loss
 
 def main():
     file_path = './528491.wav'
     pitch, duration, sample_rate = analyze_wav(file_path)
     print(pitch, duration, sample_rate)
-    wavetables = generate_wavetables(1, 12, 12,256)
-    # bounds: harmonic amplitudes = [0, 1], num_harmonics = [1, 50], num_wavetables = [1, 100], wavetable_size = [256, 2048]
-    # bounds: grain_size = [1, 1000], grain_rate = [1, 100], overlap = [0, 1]
-    #oscillator types: [0, 16]
 
-    # Create a mixer with 5 channels
+    lb = [pitch, duration, sample_rate,             0.1, 0, 0,  0,  0, 0, 0, 0, 0, 0 ,0 ,0 ,0 ,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,   256,  0.01, 0.0, 0.01, 0.0, 0.01, 0.0, 0, 0, 0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0, 0, 0]
+    ub = [pitch+1e-7, duration+1e-7, sample_rate+1e-7, 5.0, 1, 16, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 100, 2048, 2.0,  1.0, 2.0,  1.0, 2.0,  1.0, 1, 1, 1, 1.0,  2.0,  1.0,  2.0,  1.0,  2.0,  1, 1, 1]
 
-    # Set up parameters for each synthesizer
-    fm_params = {"modulator_frequency_ratio": 2.0, "modulator_amplitude": 0.5, "modulator_wave": oscillator(freq=pitch, length=duration,osc_type="sine", sr=sample_rate), 
-                 "carrier_wave": oscillator(freq=pitch, length=duration,osc_type="triangle", sr=sample_rate), "sample_rate": sample_rate, "amplitude": 2**15-1, "duration": duration, "frequency": pitch}
-    #bounds: modulator_frequency_ratio = [0.1, 5.0], modulator_amplitude = [0, 1], modulator_waveform = [0, 16], carrier_waveform = [0, 16]
-
-    #granular_params = {"input_audio": input_audio, "grain_size": 1000, "grain_rate": 10, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
-    additive_params = {"harmonics_amplitudes": [0.6, 0.3, 0.15], "frequency": pitch, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
-    #bounds: harmonics = [0, 1], num_harmonics = [1, 50]
-
-    wavetable_params = {"wavetables": wavetables, "frequency": pitch, "duration": duration, "sample_rate": sample_rate, "amplitude": 2**15-1}
-
-    # Set up mixer parameters
-    mixer_params = {"num_channels": 20}
-
-    # Set up synthesizers and mixer
-    mixer = setup_synths_and_mixer(fm_params, additive_params, wavetable_params, mixer_params, sample_rate, duration)
-
-    # Get the mixed output
-    mixed_output = mixer.mix()
-    output_file_path = 'output.wav'
-    output_sample_rate = sample_rate  # You can replace this with the sample rate of your audio
-
-    # Normalize the audio to the maximum 16-bit integer range
-    mixed_output = (mixed_output / np.max(np.abs(mixed_output)) * 32767).astype(np.int16)
-
-    # Write the audio data to a WAV file
-    wavfile.write(output_file_path, output_sample_rate, mixed_output)
+    optimized_parameters, final_loss = pso(objective_function, lb, ub)
 
 if __name__ == "__main__":
     main() 
