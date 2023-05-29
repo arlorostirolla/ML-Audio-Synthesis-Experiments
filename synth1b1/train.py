@@ -15,20 +15,27 @@ from torch.utils.tensorboard import SummaryWriter
 import sys
 from torchsynth.config import SynthConfig
 import random
-from Model import Net
+from Model import Net, ResnetModel
+import adabound
 
 def generate_data(voice, batch):
-    # Use voice to generate synth1b1 audio samples
     batch, params, _ = voice.forward(batch)
     mel_spectrograms = []
     for audio in batch:
         audio = audio.squeeze().detach().cpu().numpy().astype(np.float32)
-        # Compute Mel spectrogram
-        mel_spec = librosa.feature.melspectrogram(y=audio, sr=16000, n_mels=128)
+        mel_spec = librosa.feature.melspectrogram(y=audio, sr=16000, n_mels=345)
         mel_spec = librosa.power_to_db(mel_spec)
-        mel_spectrograms.append(mel_spec)
+        mel_spec= np.repeat(mel_spec[..., np.newaxis], 3, axis=2)
+        mel_spec = mel_spec.transpose(2, 0, 1)
+        spectrogram_normalized = np.zeros_like(mel_spec) 
+
+        for i in range(3):
+            spectrogram_channel = spectrogram_normalized[i, :, :]
+            spectrogram_normalized[i, :, :] = librosa.pcen(spectrogram_channel + abs(spectrogram_channel.min()) + 1e-6) 
+
         
-    return torch.tensor(np.array(mel_spectrograms)), params
+        mel_spectrograms.append(spectrogram_normalized)
+        return torch.tensor(np.array(mel_spectrograms)), params
 
 def load_model(path):
     net_new = Net()
@@ -57,6 +64,76 @@ def generate(file, model_path):
 
 
 if __name__ == "__main__":
+    first_run = True
+    batch_size = 32
+    writer = SummaryWriter(log_dir='./Logs/Resnet152/')
+    device = torch.device("cuda")
+    synthconfig = SynthConfig(batch_size=batch_size)
+    voice = Voice(synthconfig=synthconfig).to(device)
+    if first_run:
+        net = ResnetModel().to(device)
+    else:
+        net = load_model('./resnet0.pth').to(device)
+
+    batches = 1000000000/batch_size
+    train = range(int(batches*0.5))
+    val = range(int(batches*0.5), int(batches*0.7))
+    test = range(int(batches*0.7), int(batches))
+
+    optimizer = adabound.AdaBound(net.parameters(), lr=0.0001, weight_decay=0.0001, final_lr=0.1)
+    criterion = nn.MSELoss()
+    training_loss = 0.0
+    training_acc = 0.0
+    validation_loss = 0.0
+    validation_acc = 0.0
+    save_every = 1000
+    global_step = 0
+
+    for epoch in range(100):
+        for j in range(len(train)):
+            net.train()
+            i = random.choice(train)
+            inputs, labels = generate_data(voice, i)
+            inputs = inputs.to(device)
+            optimizer.zero_grad()
+            outputs = net(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            training_loss += loss.item()
+            training_acc += (torch.abs(outputs - labels) < 0.1).float().mean().item()
+
+            net.eval() 
+            with torch.no_grad():  
+                i = random.choice(val)
+                inputs, labels = generate_data(voice, i)
+                inputs = inputs.to(device)
+                outputs = net(inputs)
+                loss = criterion(outputs, labels)
+                validation_loss += loss.item()
+                validation_acc += (torch.abs(outputs - labels) < 0.1).float().mean().item()
+
+            if j % save_every == 0:
+                torch.save(net.state_dict(), f'resnet0.pth')
+
+            if j % 100 == 0 and global_step > 0:
+                writer.add_scalar('Training Loss', training_loss/global_step, global_step=global_step)
+                writer.add_scalar('Training Accuracy', training_acc/global_step, global_step=global_step)
+                writer.add_scalar('Validation Loss', validation_loss/global_step, global_step=global_step)
+                writer.add_scalar('Validation Accuracy', validation_acc/global_step, global_step=global_step)
+            if global_step > 0:
+                print('\r Epoch %d - Training Loss: %.3f, Validation Loss: %.3f, Training Accuracy: %.3f, Validation Accuracy: %.3f' %
+                    (epoch + 1, training_loss / global_step, validation_loss / global_step, training_acc / global_step, validation_acc / global_step), end='')
+
+            global_step += 1
+
+        
+
+
+
+
+'''
+if __name__ == "__main__":
     first_run = False
     writer = SummaryWriter(log_dir='./log3/')
     device = torch.device("cuda")
@@ -77,8 +154,7 @@ if __name__ == "__main__":
         for j in range(1, 7812500):
             i = random.randint(1, 7812499)
             inputs, labels = generate_data(voice, i)
-            inputs = inputs.unsqueeze(1).to(device)
-            labels = labels.to(device)
+            inputs = inputs.to(device)
             optimizer.zero_grad()
             outputs = net(inputs)
             loss = criterion(outputs, labels)
@@ -94,4 +170,4 @@ if __name__ == "__main__":
                 writer.add_scalar('Loss', loss, global_step=global_step)
             global_step += 1
 
-            print('\r [%d, %5d] average loss: %.3f, loss: %.3f' % (epoch + 1, j + 1, running_loss / j, loss.item()), end='')
+            print('\r [%d, %5d] average loss: %.3f, loss: %.3f' % (epoch + 1, j + 1, running_loss / j, loss.item()), end='')'''

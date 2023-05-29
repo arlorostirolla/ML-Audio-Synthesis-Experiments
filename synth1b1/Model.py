@@ -1,11 +1,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 class Net(nn.Module):
     def __init__(self, dropout_rate=0.3):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 64, 3)
+        self.conv1 = nn.Conv2d(3, 64, 3)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(64, 128, 3)
         self.conv3 = nn.Conv2d(128, 256, 3)
@@ -45,3 +46,32 @@ class Net(nn.Module):
         x = self.dropout5(x)
         x = F.sigmoid(self.fc6(x))
         return x
+
+
+
+class ResnetModel(nn.Module):
+    def __init__(self):
+        super(ResnetModel, self).__init__()
+        self.resnet = models.resnet152(pretrained=True)
+        num_in_features = self.resnet.fc.in_features
+        self.resnet.fc = nn.Identity()
+
+        # Define the new output module
+        self.fc = nn.Sequential(
+            nn.Linear(num_in_features, 2048),  
+            nn.ReLU(),  
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 78), 
+            nn.Sigmoid()
+            ,
+        )
+
+    def forward(self, x):
+        x = self.resnet(x)
+        x = self.fc(x)
+        return x
+
+    
