@@ -47,23 +47,30 @@ class Net(nn.Module):
         x = F.sigmoid(self.fc6(x))
         return x
 
-
-
 class ResnetModel(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout_rate=0.3):
         super(ResnetModel, self).__init__()
-        self.resnet = models.resnet152(pretrained=True)
+        self.resnet = models.resnet101(pretrained=True)
         num_in_features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
+
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.dropout3 = nn.Dropout(dropout_rate)
+        self.dropout4 = nn.Dropout(dropout_rate)
+        self.dropout5 = nn.Dropout(dropout_rate)
 
         # Define the new output module
         self.fc = nn.Sequential(
             nn.Linear(num_in_features, 2048),  
             nn.ReLU(),  
+            nn.Dropout(dropout_rate),
             nn.Linear(2048, 1024),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(1024, 512),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(512, 78), 
             nn.Sigmoid()
             ,
