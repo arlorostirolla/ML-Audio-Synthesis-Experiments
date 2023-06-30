@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision.models as models
+import laion_clap
+
 
 class Net(nn.Module):
     def __init__(self, dropout_rate=0.3):
@@ -54,8 +56,20 @@ class ResnetModel(nn.Module):
         num_in_features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
         
-        for param in self.resnet.parameters():
-            param.requires_grad = False
+        #for param in self.resnet.parameters():
+        #    param.requires_grad = False
+
+        self.layers = []
+        for module in self.resnet.children():
+            if isinstance(module, nn.Sequential):
+                for submodule in module.children():
+                    if isinstance(submodule, nn.Sequential):
+                        for layer in submodule.children():
+                            self.layers.append(layer)
+                    else:
+                        self.layers.append(submodule)
+            else:
+                self.layers.append(module)
 
         self.dropout1 = nn.Dropout(dropout_rate)
         self.dropout2 = nn.Dropout(dropout_rate)
@@ -83,5 +97,45 @@ class ResnetModel(nn.Module):
         x = self.resnet(x)
         x = self.fc(x)
         return x
-
+device = torch.device("cuda:0")
     
+class ClapModel(nn.Module):
+    def __init__(self, dropout_rate=0.3):
+        super(ClapModel, self).__init__()
+        
+        self.model = laion_clap.CLAP_Module(enable_fusion=True, device=device)
+        self.model.load_ckpt() 
+
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.dropout3 = nn.Dropout(dropout_rate)
+        self.dropout4 = nn.Dropout(dropout_rate)
+        self.dropout5 = nn.Dropout(dropout_rate)
+
+        # Define the new output module
+        self.fc = nn.Sequential(
+            nn.Linear(5, 2048),  
+            nn.ReLU(),  
+            nn.Dropout(dropout_rate),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 78), 
+            nn.Sigmoid()
+            ,
+        )
+
+    def forward(self, x):
+        x = self.model.get_audio_embedding_from_data(x=x, use_tensor=True)
+        print(x)
+        print(x.shape)
+        x = self.fc(x)
+        return x
+
+
+
+
+   
